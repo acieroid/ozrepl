@@ -1,0 +1,12 @@
+declare X = 21
+:help
+{Show X*2}
+:load tests/loaded.oz
+{Show {Triple LoadedValue}}
+this is not valid Oz
+{Show 777}
+:reset
+declare X = 5
+{Browse X}
+{Show X+1}
+:quit

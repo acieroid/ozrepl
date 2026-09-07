@@ -1,0 +1,9 @@
+# Generated Mozart/Oz bytecode
+Repl.ozf
+
+# Test output
+tests/session.out
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
