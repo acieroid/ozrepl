@@ -2,18 +2,16 @@
 
 A terminal REPL for Mozart/Oz.
 
-## Setup
+## Installation
 
-You need Mozart/Oz 2, Python 3, and the Python dependencies:
+You need Mozart/Oz 2 and Python 3. Make sure the Mozart commands `ozc` and
+`ozengine` are on your `PATH`, then install ozrepl with
+[pipx](https://pipx.pypa.io/):
 
 ```sh
-python3 -m pip install -r requirements.txt
-make
-./ozrepl
+pipx install git+https://github.com/acieroid/ozrepl.git
+ozrepl
 ```
-
-`make run` builds and starts the REPL. Command history is saved in
-`~/.oz_repl_history`.
 
 ## Using the REPL
 
@@ -37,4 +35,3 @@ Available REPL commands are:
 Inside tmux, `{Browse X}` opens a pane on the right. An unbound dataflow value
 is updated in place when it becomes bound. Outside tmux, the native Mozart Tk
 Browser is used.
-

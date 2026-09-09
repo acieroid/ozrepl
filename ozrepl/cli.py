@@ -5,17 +5,19 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import hashlib
 import os
 from pathlib import Path
+import queue
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 
-import pexpect
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
@@ -52,6 +54,66 @@ Editing:
 Use declare when introducing persistent variables.
 Use {Show Expression} to display a value.
 Use {Browse Expression} for the tmux side pane."""
+
+
+def find_mozart_command(name: str) -> str:
+    """Find a Mozart executable, including common macOS application paths."""
+    override = os.environ.get(name.upper())
+    candidates = [override] if override else []
+    discovered = shutil.which(name)
+    if discovered:
+        candidates.append(discovered)
+    if sys.platform == "darwin":
+        application = Path("/Applications/Mozart2.app/Contents/Resources")
+        candidates.extend((str(application / name), str(application / "bin" / name)))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise SystemExit(
+        f"Mozart/Oz command '{name}' was not found. Install Mozart 2 and make "
+        f"sure '{name}' is on PATH, or set {name.upper()} to its full path."
+    )
+
+
+def user_cache_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "ozrepl"
+
+
+def compiled_backend() -> Path:
+    """Return a development build or compile the packaged Oz source on demand."""
+    development_build = ROOT.parent / "Repl.ozf"
+    if (ROOT.parent / "Makefile").is_file() and development_build.is_file():
+        return development_build
+
+    source = ROOT / "Repl.oz"
+    ozc = find_mozart_command("ozc")
+    compiler = Path(ozc)
+    compiler_identity = f"{compiler.resolve()}:{compiler.stat().st_mtime_ns}"
+    digest = hashlib.sha256(source.read_bytes() + compiler_identity.encode()).hexdigest()[:16]
+    cache = user_cache_dir()
+    target = cache / f"Repl-{digest}.ozf"
+    if target.is_file():
+        return target
+
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="build-", dir=cache) as directory:
+        output = Path(directory) / "Repl.ozf"
+        result = subprocess.run(
+            [ozc, "--nowarnunused", "--nowarnunusedformals", "-c", str(source), "-o", str(output)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout).strip()
+            raise SystemExit("Could not compile the ozrepl backend:\n\n" + diagnostic)
+        os.replace(output, target)
+    return target
 
 
 # Mirrored from `oz-keywords` and the token matchers in Mozart's oz.el.
@@ -112,33 +174,50 @@ class BackendExited(Exception):
 
 
 class OzBackend:
-    def __init__(self, *, no_gui: bool = False) -> None:
+    def __init__(self, backend: Path, *, no_gui: bool = False) -> None:
         self.lock = threading.RLock()
         self.no_gui = no_gui
-        self.child: pexpect.spawn | None = None
+        self.backend = backend
+        self.child: subprocess.Popen[str] | None = None
+        self.output: queue.Queue[str | None] = queue.Queue()
         self.connection: socket.socket | None = None
         self._start()
 
     def _start(self) -> None:
-        self.child = pexpect.spawn(
-            "ozengine",
-            [str(ROOT / "Repl.ozf")],
+        self.output = queue.Queue()
+        self.child = subprocess.Popen(
+            [find_mozart_command("ozengine"), str(self.backend)],
             cwd=os.getcwd(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
             encoding="utf-8",
-            codec_errors="replace",
-            echo=False,
-            timeout=None,
+            errors="replace",
+            bufsize=1,
         )
-        try:
-            self.child.expect(r"__OZREPL_PORT__(\d+)")
-        except pexpect.EOF as error:
-            diagnostic = self.child.before.replace("\r\n", "\n").replace("\r", "\n").strip()
-            if not diagnostic:
-                diagnostic = "ozengine exited without printing a diagnostic"
-            raise SystemExit(
-                "Mozart/Oz backend failed during startup:\n\n" + diagnostic
-            ) from error
-        self.port = int(self.child.match.group(1))
+        assert self.child.stdout is not None
+        threading.Thread(target=self._collect_output, daemon=True).start()
+        diagnostic: list[str] = []
+        deadline = REQUEST_TIMEOUT
+        while True:
+            try:
+                line = self._read_line(deadline)
+            except BackendExited as error:
+                raise SystemExit(
+                    "Mozart/Oz backend failed during startup:\n\n" + error.diagnostic
+                ) from error
+            if line is None:
+                detail = "".join(diagnostic).strip()
+                raise SystemExit(
+                    "Mozart/Oz backend failed during startup:\n\n"
+                    + (detail or "ozengine exited without printing a diagnostic")
+                )
+            match = re.search(r"__OZREPL_PORT__(\d+)", line)
+            if match:
+                self.port = int(match.group(1))
+                break
+            diagnostic.append(line)
         self.connection = socket.create_connection(("127.0.0.1", self.port))
         self._read_until_ready()
         if self.no_gui:
@@ -153,23 +232,39 @@ class OzBackend:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
-        if self.child is not None and self.child.isalive():
-            self.child.close(force=True)
+        if self.child is not None and self.child.poll() is None:
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+
+    def _collect_output(self) -> None:
+        assert self.child is not None and self.child.stdout is not None
+        for line in self.child.stdout:
+            self.output.put(line)
+        self.output.put(None)
+
+    def _read_line(self, timeout: float) -> str | None:
+        try:
+            return self.output.get(timeout=timeout)
+        except queue.Empty as error:
+            raise BackendExited("Error: Mozart/Oz backend did not finish the request") from error
 
     def _read_until_ready(self) -> str:
-        assert self.child is not None
-        try:
-            self.child.expect_exact(READY, timeout=REQUEST_TIMEOUT)
-        except (pexpect.EOF, pexpect.TIMEOUT) as error:
-            diagnostic = self.child.before.replace("\r\n", "\n").replace("\r", "\n").strip()
-            if not diagnostic:
-                if isinstance(error, pexpect.TIMEOUT):
-                    diagnostic = "Error: Mozart/Oz backend did not finish the request"
-                else:
-                    diagnostic = "Error: Mozart/Oz backend exited unexpectedly"
-            raise BackendExited(diagnostic) from error
-        output = self.child.before.replace("\r\n", "\n").replace("\r", "\n")
-        return output.strip("\n")
+        lines: list[str] = []
+        while True:
+            line = self._read_line(REQUEST_TIMEOUT)
+            if line is None:
+                diagnostic = "".join(lines).strip()
+                raise BackendExited(diagnostic or "Error: Mozart/Oz backend exited unexpectedly")
+            if READY in line:
+                before, _, after = line.partition(READY)
+                lines.append(before)
+                if after.strip():
+                    lines.append(after)
+                return "".join(lines).replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+            lines.append(line)
 
     def submit(self, source: str) -> str:
         with self.lock:
@@ -206,11 +301,17 @@ class OzBackend:
     def quit(self) -> str:
         with self.lock:
             assert self.child is not None
-            if not self.child.isalive():
+            if self.child.poll() is not None:
                 return ""
             self._send(":quit")
-            self.child.expect(pexpect.EOF)
-            return self.child.before.replace("\r\n", "\n").strip()
+            lines: list[str] = []
+            while True:
+                line = self._read_line(REQUEST_TIMEOUT)
+                if line is None:
+                    break
+                lines.append(line)
+            self.child.wait(timeout=1)
+            return "".join(lines).replace("\r\n", "\n").strip()
 
     def close(self) -> None:
         self._close_transport()
@@ -233,7 +334,8 @@ class BrowseOutput:
                 shlex.quote(part)
                 for part in (
                     sys.executable,
-                    str(ROOT / "ozbrowse.py"),
+                    "-m",
+                    "ozrepl.browse",
                     str(self.path),
                     str(os.getpid()),
                 )
@@ -516,7 +618,10 @@ def main() -> int:
         "--browse",
         choices=("auto", "tmux", "terminal", "gui"),
         default="auto",
-        help="Browse destination: tmux in a tmux session, otherwise Tk (default: auto)",
+        help=(
+            "Browse destination: tmux in tmux, terminal on Windows, otherwise Tk "
+            "(default: auto)"
+        ),
     )
     parser.add_argument(
         "--vi",
@@ -541,19 +646,22 @@ def main() -> int:
     if arguments.file is not None and not arguments.file.is_file():
         parser.error(f"file not found: {arguments.file}")
 
-    # Inline editing defaults to Emacs bindings, but C-x C-e consistently
-    # opens the bundled syntax-aware Vim/Neovim launcher in either mode.
-    os.environ["VISUAL"] = f"sh {shlex.quote(str(ROOT / 'oz-vim'))}"
-
-    if not (ROOT / "Repl.ozf").exists():
-        raise SystemExit("Repl.ozf is missing; run `make` in the ozrepl directory")
+    # Use the checkout's syntax-aware helper without overriding a configured editor.
+    editor_helper = ROOT.parent / "oz-vim"
+    if os.name == "posix" and editor_helper.is_file():
+        os.environ.setdefault("VISUAL", f"sh {shlex.quote(str(editor_helper))}")
 
     USE_COLOR = sys.stdout.isatty() and not arguments.no_color and "NO_COLOR" not in os.environ
     terminal = Input(vi_mode=arguments.vi, color=USE_COLOR)
     browse_mode = arguments.browse
     if browse_mode == "auto":
-        browse_mode = "tmux" if os.environ.get("TMUX") else "gui"
-    backend = OzBackend(no_gui=browse_mode != "gui")
+        if os.environ.get("TMUX"):
+            browse_mode = "tmux"
+        elif sys.platform == "win32":
+            browse_mode = "terminal"
+        else:
+            browse_mode = "gui"
+    backend = OzBackend(compiled_backend(), no_gui=browse_mode != "gui")
     browser = BrowseOutput(browse_mode)
     output_lock = threading.Lock()
 

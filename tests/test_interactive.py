@@ -4,6 +4,7 @@
 from pathlib import Path
 import os
 import shlex
+import sys
 import tempfile
 
 import pexpect
@@ -13,8 +14,8 @@ root = Path(__file__).resolve().parent.parent
 environment = dict(os.environ, TERM="xterm-256color")
 environment.pop("NO_COLOR", None)
 child = pexpect.spawn(
-    str(root / "ozrepl"),
-    ["--browse=terminal"],
+    sys.executable,
+    ["-m", "ozrepl", "--browse=terminal"],
     cwd=str(root),
     env=environment,
     encoding="utf-8",
@@ -99,8 +100,8 @@ with tempfile.TemporaryDirectory(prefix="ozrepl argument watch ") as directory:
         encoding="utf-8",
     )
     child = pexpect.spawn(
-        str(root / "ozrepl"),
-        ["--browse=terminal", "--clear", str(watched)],
+        sys.executable,
+        ["-m", "ozrepl", "--browse=terminal", "--clear", str(watched)],
         cwd=str(root),
         env=environment,
         encoding="utf-8",

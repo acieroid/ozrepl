@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-./ozrepl --browse=terminal < tests/session.in > tests/session.out 2>&1
+python3 -m ozrepl --browse=terminal < tests/session.in > tests/session.out 2>&1
 
 for expected in "Commands:" "Alt-Enter" 42 300 777 5 6 "parse error" \
     "compiler environment reset" bye; do

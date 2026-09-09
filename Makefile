@@ -5,11 +5,11 @@ OZFLAGS := --nowarnunused --nowarnunusedformals
 
 all: Repl.ozf
 
-Repl.ozf: Repl.oz
+Repl.ozf: ozrepl/Repl.oz
 	$(OZC) $(OZFLAGS) -c $< -o $@
 
 run: Repl.ozf
-	./ozrepl
+	python3 -m ozrepl
 
 test: Repl.ozf
 	./tests/test.sh
