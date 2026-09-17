@@ -333,35 +333,67 @@ class BrowseOutput:
         self.mode = mode
         self.path: Path | None = None
         self.pane: str | None = None
-        if self.mode == "tmux":
-            temporary = tempfile.NamedTemporaryFile(
-                prefix="ozrepl-browse-", suffix=".log", delete=False
+
+    def _open_tmux(self) -> None:
+        """Create the Browse pane on demand for the first browsed value."""
+        temporary = tempfile.NamedTemporaryFile(
+            prefix="ozrepl-browse-", suffix=".log", delete=False
+        )
+        temporary.close()
+        self.path = Path(temporary.name)
+        command = " ".join(
+            shlex.quote(part)
+            for part in (
+                sys.executable,
+                "-m",
+                "ozrepl.browse",
+                str(self.path),
+                str(os.getpid()),
             )
-            temporary.close()
-            self.path = Path(temporary.name)
-            command = " ".join(
-                shlex.quote(part)
-                for part in (
-                    sys.executable,
-                    "-m",
-                    "ozrepl.browse",
-                    str(self.path),
-                    str(os.getpid()),
-                )
+        )
+        try:
+            result = subprocess.run(
+                ["tmux", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}", command],
+                check=True,
+                capture_output=True,
+                text=True,
             )
+            self.pane = result.stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(f"warning: cannot open tmux Browse pane: {error}", file=sys.stderr)
+            self.mode = "terminal"
+
+    def _tmux_pane_exists(self) -> bool:
+        if self.pane is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                return False
+            panes = (line.split("\t", 1) for line in result.stdout.splitlines())
+            return any(pane == self.pane and dead == "0" for pane, dead in panes)
+        except OSError:
+            return False
+
+    def _discard_tmux_output(self) -> None:
+        self.pane = None
+        if self.path is not None:
             try:
-                result = subprocess.run(
-                    ["tmux", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}", command],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.pane = result.stdout.strip()
-            except (OSError, subprocess.CalledProcessError) as error:
-                print(f"warning: cannot open tmux Browse pane: {error}", file=sys.stderr)
-                self.mode = "terminal"
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            self.path = None
 
     def write(self, identifier: str, value: str, *, update: bool = False) -> None:
+        if self.mode == "tmux" and self.pane is not None and not self._tmux_pane_exists():
+            self._discard_tmux_output()
+        if self.mode == "tmux" and self.path is None:
+            self._open_tmux()
         if self.mode == "tmux" and self.path is not None:
             with self.path.open("a", encoding="utf-8") as stream:
                 operation = "U" if update else "B"

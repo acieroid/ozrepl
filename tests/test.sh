@@ -25,6 +25,7 @@ for unwanted in "Mozart Compiler" "accepted" "Declared variables" \
 done
 
 python3 tests/test_interactive.py
+python3 tests/test_browse_output.py
 python3 tests/test_vim.py
 
 echo "ozrepl integration test passed"
