@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 
 python3 -m ozrepl --browse=terminal < tests/session.in > tests/session.out 2>&1
 
-for expected in "Commands:" "Alt-Enter" 42 300 777 5 6 "parse error" \
+for expected in "Commands:" "Alt-Enter" 42 300 777 5 6 "Parse error" \
+    "Expected type: integer" 888 "Expected type: float" 999 \
     "compiler environment reset" bye; do
     if ! grep -Fq "$expected" tests/session.out; then
         echo "missing expected output: $expected" >&2
@@ -15,7 +16,7 @@ for expected in "Commands:" "Alt-Enter" 42 300 777 5 6 "parse error" \
 done
 
 for unwanted in "Mozart Compiler" "accepted" "Declared variables" \
-    "__OZREPL_BROWSE__"; do
+    "__OZREPL_BROWSE__" "backend restarted" "_<optimized>"; do
     if grep -Fq "$unwanted" tests/session.out; then
         echo "unexpected raw compiler output: $unwanted" >&2
         sed -n '1,240p' tests/session.out >&2

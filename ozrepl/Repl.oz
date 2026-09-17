@@ -18,19 +18,34 @@ define
 
    proc {TerminalBrowse Value}
       Id = @BrowseCounter
+      proc {ReportFailure}
+         try
+            {Wait Value}
+         catch Error then
+            {System.showError Error}
+         end
+      end
    in
       BrowseCounter := Id+1
       %% A Browse entry first shows its current shape. A watcher then waits for
       %% an undetermined top-level value and updates the same entry when it is
       %% bound, preserving Oz's dataflow behaviour.
-      {System.showInfo "__OZREPL_BROWSE__"#Id}
-      {System.show Value}
-      if {IsDet Value} then skip
+      if {IsFailed Value} then
+         {ReportFailure}
       else
-         thread
-            {Wait Value}
-            {System.showInfo "__OZREPL_BROWSE_UPDATE__"#Id}
-            {System.show Value}
+         {System.showInfo "__OZREPL_BROWSE__"#Id}
+         {System.show Value}
+         if {IsDet Value} then skip
+         else
+            thread
+               try
+                  {Wait Value}
+                  {System.showInfo "__OZREPL_BROWSE_UPDATE__"#Id}
+                  {System.show Value}
+               catch Error then
+                  {System.showError Error}
+               end
+            end
          end
       end
    end
@@ -58,7 +73,7 @@ define
       %% Show, Print, and System available in every later fragment.
       {Engine enqueue(mergeEnv(Environment))}
       {Interface sync()}
-      compiler(engine:Engine interface:Interface)
+      compiler(engine:Engine interface:Interface browse:BrowseProcedure)
    end
 
    fun {ReportErrors Interface}
@@ -93,7 +108,35 @@ define
          ])}
          {CompilerState.interface sync()}
          if {ReportErrors CompilerState.interface} then skip
-         else {System.show ResultRecord.result}
+         else
+            {Wait ResultRecord.result}
+            case ResultRecord.result
+            of ozreplValue(Value) then {System.show Value}
+            [] ozreplError then skip
+            end
+         end
+      catch Error then
+         {System.showError Error}
+      end
+   end
+
+   proc {EvaluateBrowse CompilerState Source}
+      ResultRecord = return(result:_)
+   in
+      try
+         {CompilerState.engine enqueue([
+            setSwitch(expression true)
+            feedVirtualString(Source ResultRecord)
+            setSwitch(expression false)
+         ])}
+         {CompilerState.interface sync()}
+         if {ReportErrors CompilerState.interface} then skip
+         else
+            {Wait ResultRecord.result}
+            case ResultRecord.result
+            of ozreplValue(Value) then {CompilerState.browse Value}
+            [] ozreplError then skip
+            end
          end
       catch Error then
          {System.showError Error}
@@ -175,6 +218,7 @@ define
             {Loop Client CompilerState UseGui}
          [] none then
             if Tag == &E then {EvaluateExpression CompilerState Source}
+            elseif Tag == &B then {EvaluateBrowse CompilerState Source}
             else {Evaluate CompilerState Source}
             end
             {Loop Client CompilerState UseGui}

@@ -33,6 +33,7 @@ from pygments.token import Comment, Keyword, Name, Number, Operator, Punctuation
 READY = "__OZREPL_READY__"
 BROWSE_MARKER = "__OZREPL_BROWSE__"
 BROWSE_UPDATE_MARKER = "__OZREPL_BROWSE_UPDATE__"
+RUNTIME_ERROR_MARKER = "__OZREPL_RUNTIME_ERROR__"
 REQUEST_TIMEOUT = 5
 ROOT = Path(__file__).resolve().parent
 USE_COLOR = False
@@ -269,7 +270,15 @@ class OzBackend:
     def submit(self, source: str) -> str:
         with self.lock:
             try:
-                self._send(source, expression=is_expression(source))
+                browse_expression = get_browse_expression(source)
+                if browse_expression is not None and not re.fullmatch(
+                    r"[A-Z_][\w.]*", browse_expression.strip()
+                ):
+                    self._send(wrap_expression(browse_expression), tag=b"B")
+                elif is_expression(source):
+                    self._send(wrap_expression(source), tag=b"E")
+                else:
+                    self._send(source)
                 return self._read_until_ready()
             except BackendExited:
                 self._restart()
@@ -524,12 +533,51 @@ def is_expression(source: str) -> bool:
     return True
 
 
+def get_browse_expression(source: str) -> str | None:
+    """Return the argument of a top-level Browse call, if it has one."""
+    match = re.match(r"^\s*\{Browse\s+(.+)\}\s*$", source, re.DOTALL)
+    return match.group(1) if match else None
+
+
+def wrap_expression(source: str) -> str:
+    """Capture a runtime failure before it can poison the compiler request."""
+    return (
+        f"(try ozreplValue({source}) "
+        f'catch Error then {{System.showInfo "{RUNTIME_ERROR_MARKER}"}} '
+        "{System.show Error} ozreplError end)"
+    )
+
+
 def clean_output(output: str) -> str:
     """Condense Mozart's compiler boxes while leaving program output intact."""
+    lines = output.replace("\r\n", "\n").splitlines()
+    rendered: list[str] = []
+    index = 0
+    while index < len(lines):
+        if lines[index] == RUNTIME_ERROR_MARKER and index + 1 < len(lines):
+            error = lines[index + 1]
+            type_error = re.match(
+                r"error\([^:]+:kernel\(type .* (?:'([^']+)'|([A-Za-z][\w]*)) "
+                r"\d+ nil\)",
+                error,
+            )
+            if type_error:
+                expected_type = type_error.group(1) or type_error.group(2)
+                rendered.append(
+                    f"Error: Type error: Expected type: {expected_type.lower()}"
+                )
+            else:
+                rendered.append(f"Error: Runtime error: {error}")
+            index += 2
+        else:
+            rendered.append(lines[index])
+            index += 1
+    output = "\n".join(rendered)
+
     if not re.search(r"^%\*{5,}", output, re.MULTILINE):
         return output.strip("\n")
 
-    lines = output.replace("\r\n", "\n").splitlines()
+    lines = output.splitlines()
     errors: list[str] = []
     title_pattern = re.compile(r"^%\*{10,}\s+(.+?)\s+\*{10,}$")
     location_pattern = re.compile(
